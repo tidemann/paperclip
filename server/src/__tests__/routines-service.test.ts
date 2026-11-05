@@ -1448,6 +1448,67 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(routineIssues[0]?.id).toBe(previousIssue.id);
   });
 
+  it("coalesces scheduled ticks into an in-progress execution issue between heartbeats", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    const previousRunId = randomUUID();
+    // In progress, but no live heartbeat run (quota-suspended or monitor-backed).
+    const previousIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "in_progress",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "schedule",
+      status: "issue_created",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: previousIssue.id,
+    });
+
+    for (let tick = 0; tick < 2; tick += 1) {
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+      expect(run.status).toBe("coalesced");
+      expect(run.linkedIssueId).toBe(previousIssue.id);
+      expect(run.coalescedIntoRunId).toBe(previousRunId);
+    }
+    const countIssues = async () =>
+      (await db.select({ id: issues.id }).from(issues).where(eq(issues.originId, routine.id))).length;
+    expect(await countIssues()).toBe(1);
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, previousIssue.id));
+    const next = await svc.runRoutine(routine.id, { source: "schedule" });
+    expect(next.status).toBe("issue_created");
+    expect(next.linkedIssueId).not.toBe(previousIssue.id);
+    expect(await countIssues()).toBe(2);
+  });
+
+  it("does not let a blocked execution issue without a live run hold the routine", async () => {
+    const { companyId, issueSvc, routine, svc } = await seedFixture();
+    await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "blocked",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: randomUUID(),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+    expect(run.status).toBe("issue_created");
+  });
+
   it("touches a coalesced routine issue for the manual runner's inbox", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const userId = randomUUID();

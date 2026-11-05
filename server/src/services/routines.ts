@@ -83,6 +83,7 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+const IN_FLIGHT_ISSUE_STATUSES = ["in_progress", "in_review"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
@@ -1555,7 +1556,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    const contextBoundIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1579,6 +1580,30 @@ export function routineService(
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (contextBoundIssue) return contextBoundIssue;
+
+    // An execution issue that is still being worked on stays active between
+    // heartbeats (quota suspension, scheduled monitor, waiting for the next
+    // wake). Without this, every tick that lands between heartbeats created
+    // another execution issue despite coalesce_if_active / skip_if_active.
+    // Idle todo, blocked and backlog issues are excluded so a parked or stranded
+    // execution does not stop the routine forever.
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, IN_FLIGHT_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
